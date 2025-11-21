@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AGTBANK Crypto Savings App</title>
+    <!-- Load Tailwind CSS --><script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Inter font --><style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        body { 
+            font-family: 'Inter', sans-serif; 
+            /* Blue and White Stripe Background */
+            background: repeating-linear-gradient(
+                45deg,
+                #1a202c, /* Dark Blue-Gray */
+                #1a202c 10px,
+                #2d3748 10px, /* Slightly Lighter Blue-Gray */
+                #2d3748 20px
+            );
+            background-attachment: fixed; /* Keep stripes fixed when scrolling */
+        }
+    </style>
+</head>
+<body class="min-h-screen p-4 sm:p-8">
+
+    <div id="app" class="max-w-xl mx-auto py-8 bg-gray-900 bg-opacity-90 rounded-lg shadow-2xl p-6">
+        <!-- Content will be rendered here by JavaScript --></div>
+
+    <!-- Load Firebase SDKs --><script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- CONFIGURATION ---
+        const DAILY_INTEREST_RATE = 0.000000008;
+        const AGT_SYMBOL = 'AGT';
+        const BTCYT_SYMBOL = 'BTCYT';
+        const WALLET_SYSTEM_LINK = "https://agtwallet-bestest.vercel.app/"; 
+        
+        // Global variables provided by the Canvas environment (Mandatory usage)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-agtoken-bank-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? initialAuthToken : null; // Fixed: Use initialAuthToken variable itself
+
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+        let userDepositData = {
+            depositAmount: 0,
+            totalEarned: 0,
+            lastInterestUpdate: Date.now(),
+            walletAddress: null,
+        };
+        let depositInput = '';
+        let isLoading = true;
+        let message = '';
+        let isGeneratingWallet = false;
+
+        // Utility function to generate a 52-digit Wallet Address starting with J6 or J8
+        function generateWalletAddress() {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            let address = Math.random() < 0.5 ? 'J6' : 'J8';
+            for (let i = 2; i < 52; i++) {
+                address += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return address;
+        }
+
+        // Firestore path reference
+        function getUserDocRef(uid) {
+            if (!db) return null;
+            return doc(db, `artifacts/${appId}/users/${uid}/agtoken_data`, 'deposit_state');
+        }
+
+        // Interest Calculation Logic
+        function calculateEarnings(data) {
+            if (data.depositAmount <= 0) return { newEarnings: data.totalEarned, newLastUpdate: data.lastInterestUpdate, daysEarned: 0 };
+
+            const currentTime = Date.now();
+            const lastUpdate = data.lastInterestUpdate;
+            
+            // Calculate full days passed since last update
+            const msPerDay = 24 * 60 * 60 * 1000;
+            const timeDiffMs = currentTime - lastUpdate;
+            const daysPassed = Math.floor(timeDiffMs / msPerDay);
+
+            if (daysPassed > 0) {
+                // BTCYT earned = Deposit * Rate * Days
+                const interestPerDay = data.depositAmount * DAILY_INTEREST_RATE;
+                const newEarnings = data.totalEarned + (interestPerDay * daysPassed);
+
+                // Set the next update time to the start of the next day cycle
+                const newLastUpdate = lastUpdate + (daysPassed * msPerDay);
+
+                return { newEarnings, newLastUpdate, daysEarned: daysPassed };
+            }
+            return { newEarnings: data.totalEarned, newLastUpdate: data.lastInterestUpdate, daysEarned: 0 };
+        }
+
+        // --- RENDER FUNCTIONS ---
+        function setMessage(msg) {
+            message = msg;
+            renderApp();
+            if (msg) {
+                setTimeout(() => {
+                    message = '';
+                    renderApp();
+                }, 5000);
+            }
+        }
+
+        function renderApp() {
+            const appDiv = document.getElementById('app');
+            const interestDisplay = DAILY_INTEREST_RATE.toFixed(9).replace(/0*$/, '');
+            const formattedDeposit = userDepositData.depositAmount.toFixed(2);
+            const formattedEarned = userDepositData.totalEarned.toFixed(9);
+
+            if (isLoading && !userId) {
+                appDiv.innerHTML = `
+                    <div class="flex justify-center items-center h-screen text-white">
+                        <svg class="animate-spin -ml-1 mr-3 h-8 w-8 text-yellow-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <p>Loading AGTBANK...</p>
+                    </div>
+                `;
+                return;
+            }
+
+            // Main App HTML structure
+            appDiv.innerHTML = `
+                <!-- Header --><div class="text-center pb-6 border-b border-white/10">
+                    <h1 class="text-4xl font-extrabold tracking-tight text-yellow-400">AGTBANK</h1>
+                    <p class="mt-2 text-lg text-gray-300">
+                        The better way to grow your ${AGT_SYMBOL} holdings.
+                    </p>
+                </div>
+
+                <!-- Message Box -->${message ? `
+                    <div class="mt-4 p-3 bg-yellow-800/50 text-white rounded-lg text-center font-medium shadow-xl">
+                        ${message}
+                    </div>
+                ` : ''}
+
+                <!-- Interest Card --><div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-yellow-500/30 mt-8">
+                    <h2 class="text-xl font-semibold text-yellow-400">Daily ${BTCYT_SYMBOL} Interest Rate</h2>
+                    <p class="mt-1 text-4xl font-bold text-white">
+                        ${interestDisplay} <span class="text-yellow-400">${BTCYT_SYMBOL}</span>
+                    </p>
+                    <p class="text-sm text-gray-400 mt-2">
+                        Earn ${interestDisplay} ${BTCYT_SYMBOL} on your ${AGT_SYMBOL} deposit, compounded daily.
+                    </p>
+                    <p class="text-xs text-gray-500 mt-2">
+                        (This rate is applied to your total AGT deposit amount.)
+                    </p>
+                </div>
+
+                <!-- Balance Section --><div class="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="bg-gray-700 p-5 rounded-xl border border-gray-600">
+                        <p class="text-gray-300 text-sm font-medium">Your Total ${AGT_SYMBOL} Deposit</p>
+                        <p class="text-3xl font-bold text-white mt-1">${formattedDeposit}</p>
+                    </div>
+                    <div class="bg-gray-700 p-5 rounded-xl border border-gray-600">
+                        <p class="text-gray-300 text-sm font-medium">Total ${BTCYT_SYMBOL} Earned</p>
+                        <p class="text-3xl font-bold text-yellow-400 mt-1">${formattedEarned}</p>
+                    </div>
+                </div>
+
+                <!-- Wallet Section --><div class="mt-8">
+                    <h2 class="text-2xl font-semibold text-white mb-4 flex items-center">
+                        Wallet Setup & Acquisition 
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 ml-2 text-yellow-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+                        </svg>
+                    </h2>
+
+                    <div class="bg-gray-800 p-6 rounded-xl shadow-inner border-2 border-dashed border-yellow-500/50">
+                        <p class="text-gray-300 mb-4 font-medium">
+                            Step 1: Get your ${AGT_SYMBOL} Wallet and Tokens
+                        </p>
+                        <a 
+                            href="${WALLET_SYSTEM_LINK}" 
+                            target="_blank" 
+                            rel="noopener noreferrer" 
+                            class="w-full inline-block text-center bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-500 transition duration-150 shadow-md hover:shadow-xl"
+                        >
+                            Buy AGT & Create Wallet (External Link)
+                        </a>
+                        <p class="text-xs text-gray-400 mt-2 text-center">
+                            ${WALLET_SYSTEM_LINK}
+                        </p>
+
+                        <div class="border-t border-white/10 my-6"></div>
+
+                        <p class="text-gray-300 mb-4 font-medium">
+                            Step 2: Start AGTBANK Simulation Deposit
+                        </p>
+
+                        ${!userDepositData.walletAddress ? `
+                            <p class="text-gray-400 mb-4 text-sm">
+                                Click below to generate a **simulated 52-digit address** (J6/J8-prefixed) to enable deposits in this demo.
+                            </p>
+                            <button
+                                id="createWalletButton"
+                                class="w-full bg-yellow-600 text-gray-900 font-bold py-3 px-4 rounded-lg hover:bg-yellow-500 transition duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-md hover:shadow-xl"
+                                ${isGeneratingWallet ? 'disabled' : ''}
+                            >
+                                ${isGeneratingWallet ? 'Generating...' : 'Generate Simulation Wallet Address'}
+                            </button>
+                        ` : `
+                            <div class="bg-gray-700 p-4 rounded-lg break-all text-sm font-mono text-green-400 border border-green-500/50">
+                                <p class="text-gray-400 mb-1">Simulated ${AGT_SYMBOL} Wallet Address:</p>
+                                ${userDepositData.walletAddress}
+                            </div>
+                        `}
+                    </div>
+                </div>
+
+                <!-- Deposit Section --><div class="mt-8">
+                    <h2 class="text-2xl font-semibold text-white mb-4 flex items-center">
+                        Deposit ${AGT_SYMBOL}
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 ml-2 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M12 8c1.657 0 3 .895 3 2s-1.343 2-3 2h-1a2 2 0 01-2-2v-1a2 2 0 012-2h1zm0 0V4" />
+                        </svg>
+                    </h2>
+                    <div class="bg-gray-800 p-6 rounded-xl shadow-inner">
+                        <div class="flex flex-col sm:flex-row items-center space-y-4 sm:space-y-0 sm:space-x-4">
+                            <input
+                                type="number"
+                                id="depositInput"
+                                placeholder="Amount to deposit (AGT)"
+                                value="${depositInput}"
+                                class="w-full sm:w-2/3 bg-gray-700 text-white p-3 rounded-lg border border-gray-600 focus:ring-yellow-500 focus:border-yellow-500 transition duration-150"
+                                ${!userDepositData.walletAddress || isLoading ? 'disabled' : ''}
+                            />
+                            <button
+                                id="depositButton"
+                                class="w-full sm:w-1/3 bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-500 transition duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-md hover:shadow-xl"
+                                ${!userDepositData.walletAddress || isLoading || depositInput <= 0 ? 'disabled' : ''}
+                            >
+                                Deposit
+                            </button>
+                        </div>
+                        ${!userDepositData.walletAddress ? `
+                            <p class="mt-4 text-sm text-red-400 font-medium">
+                                Deposit is disabled. Please create a simulated wallet address above first.
+                            </p>
+                        ` : ''}
+                        <p class="mt-4 text-gray-400 text-sm">
+                            The longer you leave your ${AGT_SYMBOL} deposited, the more ${BTCYT_SYMBOL} you'll earn daily.
+                        </p>
+                    </div>
+                </div>
+                
+                <!-- Footer --><div class="mt-10 pt-6 border-t border-white/10 text-center">
+                    <p class="text-xs text-gray-500">
+                        User ID: ${userId || 'Authenticating...'}
+                    </p>
+                    <p class="text-xs text-red-500 mt-1">
+                        Disclaimer: This is a simulation for demonstration purposes. AGT and BTCYT are fictional assets. Deposits and earnings are simulated using the daily interest rate of ${interestDisplay}.
+                    </p>
+                </div>
+            `;
+            
+            // Re-attach event listeners after rendering
+            const createWalletBtn = document.getElementById('createWalletButton');
+            if (createWalletBtn) {
+                createWalletBtn.onclick = handleGenerateSimulationWallet;
+            }
+
+            const depositInputEl = document.getElementById('depositInput');
+            if (depositInputEl) {
+                depositInputEl.oninput = (e) => {
+                    depositInput = e.target.value;
+                    // Render again to update the deposit button's disabled state
+                    renderApp(); 
+                };
+            }
+
+            const depositButtonEl = document.getElementById('depositButton');
+            if (depositButtonEl) {
+                depositButtonEl.onclick = handleDeposit;
+            }
+        }
+
+        // --- AUTHENTICATION & DATA HANDLING ---
+
+        async function initFirebase() {
+            if (Object.keys(firebaseConfig).length === 0) {
+                console.error("Firebase config is missing. Cannot initialize.");
+                isLoading = false;
+                renderApp();
+                return;
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Sign in or listen for state change
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        startDataListener();
+                    } else {
+                        try {
+                            if (initialAuthToken) {
+                                await signInWithCustomToken(auth, initialAuthToken);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        } catch (e) {
+                            console.error("Authentication failed:", e);
+                            isAuthReady = true;
+                            startDataListener(); // Try to start listener anyway, though it might fail if rules are strict
+                        }
+                    }
+                });
+            } catch (e) {
+                console.error("Firebase initialization failed:", e);
+                isLoading = false;
+                renderApp();
+            }
+        }
+
+        function startDataListener() {
+            if (!isAuthReady || !userId || !db) return;
+
+            const userDocRef = getUserDocRef(userId);
+
+            onSnapshot(userDocRef, (docSnap) => {
+                let currentData = {
+                    depositAmount: 0,
+                    totalEarned: 0,
+                    lastInterestUpdate: Date.now(),
+                    walletAddress: null,
+                };
+
+                if (docSnap.exists()) {
+                    currentData = docSnap.data();
+                }
+                
+                // Ensure lastInterestUpdate is a number (it might be a Firebase timestamp object on first load)
+                if (currentData.lastInterestUpdate && typeof currentData.lastInterestUpdate.toDate === 'function') {
+                    currentData.lastInterestUpdate = currentData.lastInterestUpdate.toDate().getTime();
+                } else if (!currentData.lastInterestUpdate) {
+                    currentData.lastInterestUpdate = Date.now();
+                }
+
+                // Calculate any accrued interest since the last update
+                const { newEarnings, newLastUpdate, daysEarned } = calculateEarnings(currentData);
+
+                if (daysEarned > 0) {
+                    // Update the database with the new earned amount and update time
+                    setDoc(userDocRef, {
+                        ...currentData,
+                        totalEarned: newEarnings,
+                        lastInterestUpdate: newLastUpdate,
+                    }, { merge: true }).catch(console.error);
+
+                    setMessage(`🥳 Earned ${daysEarned} day(s) worth of ${BTCYT_SYMBOL}!`); // Fixed variable name
+                }
+                
+                userDepositData = {
+                    ...currentData,
+                    totalEarned: newEarnings, // Display the calculated (and potentially updated) earnings
+                };
+                isLoading = false;
+                renderApp();
+
+            }, (error) => {
+                console.error("Error listening to Firestore:", error);
+                isLoading = false;
+                renderApp();
+            });
+        }
+        
+        // Function to create a new simulated wallet
+        async function handleGenerateSimulationWallet() {
+            if (!userId || !db) {
+                setMessage("Bank not ready. Please wait.");
+                return;
+            }
+            if (userDepositData.walletAddress) {
+                setMessage("You already have a simulated wallet address.");
+                return;
+            }
+
+            isGeneratingWallet = true;
+            renderApp();
+            setMessage("Generating secure, 52-digit simulation wallet address...");
+            try {
+                const newWallet = generateWalletAddress();
+                const userDocRef = getUserDocRef(userId);
+
+                await setDoc(userDocRef, {
+                    walletAddress: newWallet,
+                    depositAmount: 0,
+                    totalEarned: 0,
+                    lastInterestUpdate: Date.now(),
+                }, { merge: true });
+
+                setMessage("Simulation wallet successfully created! Now you can deposit.");
+            } catch (e) {
+                console.error("Error creating wallet:", e);
+                setMessage("Failed to create simulation wallet. Please try again.");
+            } finally {
+                isGeneratingWallet = false;
+                renderApp();
+            }
+        }
+
+        // Function to handle the AGT deposit
+        async function handleDeposit() {
+            if (!userId || !db || !userDepositData.walletAddress) {
+                setMessage("Please generate a simulation wallet first.");
+                return;
+            }
+            const amount = parseFloat(depositInput);
+            if (isNaN(amount) || amount <= 0) {
+                setMessage("Please enter a valid deposit amount.");
+                return;
+            }
+
+            isLoading = true;
+            renderApp();
+            try {
+                const userDocRef = getUserDocRef(userId);
+                const newDepositAmount = userDepositData.depositAmount + amount;
+                
+                // Calculate earnings up to this point before depositing
+                const { newEarnings, newLastUpdate } = calculateEarnings(userDepositData);
+
+                await setDoc(userDocRef, {
+                    depositAmount: newDepositAmount,
+                    totalEarned: newEarnings,
+                    // Reset interest update time when depositing
+                    lastInterestUpdate: newLastUpdate, 
+                }, { merge: true });
+
+                setMessage(`Deposit of ${amount.toFixed(2)} ${AGT_SYMBOL} successful!`);
+                depositInput = '';
+            } catch (e) {
+                console.error("Error depositing AGT:", e);
+                setMessage("Deposit failed. Please try again.");
+            } finally {
+                isLoading = false;
+                renderApp();
+            }
+        }
+        
+        // Start the application
+        window.onload = initFirebase;
+    </script>
+</body>
+</html>
